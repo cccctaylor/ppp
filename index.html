@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pickleball Scheduler</title>
+  <style>
+    :root {
+      --gap: 12px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --body: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      --ink: #0b1320; --muted: #6b7688; --line: #dfe3ea; --bg: #f7f8fb; --warn: #b00020; --ok: #135d13;
+      --warn-bg: #fff3f3; --warn-border: #ffc7c7;
+    }
+    html, body { height: 100%; }
+    body { font-family: var(--body); color: var(--ink); margin: 16px; }
+
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    h2 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); }
+    .col { display: flex; flex-direction: column; gap: 8px; }
+    label { font-size: 12px; color: var(--muted); }
+
+    textarea, input[type="text"], input[type="number"], button {
+      font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: white; color: inherit;
+    }
+    textarea { min-height: 120px; resize: vertical; }
+
+    .row { display: flex; gap: var(--gap); align-items: center; flex-wrap: wrap; }
+
+    .controls button { padding: 10px 14px; cursor: pointer; }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+    .warn {
+      color: var(--warn);
+      font-size: 14px; /* larger */
+      background: var(--warn-bg);
+      border: 2px solid var(--warn-border);
+      border-left: 6px solid var(--warn);
+      padding: 10px 12px;
+      border-radius: 8px;
+    }
+    .muted { color: var(--muted); font-size: 12px; }
+
+    .error { border-color: var(--warn); box-shadow: 0 0 0 2px rgba(176,0,32,0.1); }
+
+    pre#output { font-family: var(--mono); white-space: pre; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; }
+
+    #summary { color: var(--muted); font-size: 14px; margin-top: 6px; }
+    #summary .percent { font-weight: 700; font-size: 18px; }
+
+    .hidden { display: none !important; }
+
+    .out-controls { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .out-controls input[type="text"] { width: 180px; }
+  </style>
+</head>
+<body>
+  <h1>Pickleball Scheduler</h1>
+
+  <div class="grid">
+    <div class="col">
+      <h2>Players</h2>
+      <label for="males">Male players (one per line or commas)</label>
+      <textarea id="males" placeholder="Joe&#10;Frank&#10;Chris"></textarea>
+
+      <label for="females">Female players (one per line or commas)</label>
+      <textarea id="females" placeholder="Anna&#10;Liz&#10;Kim"></textarea>
+    </div>
+
+    <div class="col">
+      <h2>Courts & Schedule</h2>
+      <label for="courts">Court names (spaces, commas, or new lines)</label>
+      <textarea id="courts" placeholder="1 2 4"></textarea>
+
+      <div class="row">
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          <label for="start">Start time</label>
+          <input id="start" type="text" value="06:00 AM" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          <label for="slot">Slot length (min)</label>
+          <input id="slot" type="number" min="5" max="120" value="15" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          <label for="cycles"># of cycles</label>
+          <input id="cycles" type="number" min="1" max="30" value="8" />
+        </div>
+      </div>
+
+      <div class="row controls" style="margin-top:8px;">
+        <button id="generate">Generate</button>
+        <button id="tryAgain" disabled>Try for better</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="warnings" class="warn hidden" style="margin-top:10px;"></div>
+
+  <h2>Output</h2>
+  <pre id="output" aria-live="polite">(no schedule yet)</pre>
+  <div id="summary"></div>
+  <div class="out-controls">
+    <label class="muted" for="printTitle">Title</label>
+    <input id="printTitle" type="text" value="Sunrise Smashers" />
+    <label class="muted" for="printSubtitle">Subtitle</label>
+    <input id="printSubtitle" type="text" value="Schedule" />
+    <button id="copyBtn" disabled>Copy</button>
+    <button id="printBtn" disabled>Print</button>
+  </div>
+
+  <script>
+  // ----------------------------
+  // Config (tweakable in code)
+  // ----------------------------
+  const CONFIG = {
+    ITERATIONS: 3000, // iterations per run; tune for performance
+    WEIGHTS: {
+      MIXED_FOURSOME: +12,
+      THREE_ONE: -10,
+      FOUR_ZERO: -6,
+      SEGREGATED_TEAMS: -5,
+      REPEAT_PARTNER: -14,
+      REPEAT_OPPONENT: -4,
+      BYE_EXCESS: -30,
+      BYE_CONSECUTIVE: -6,
+    },
+    LOCAL: { // heuristic for choosing pairings inside a foursome
+      MIXED_PAIR: +3,
+      MIXED_BOTH_PAIRS: +6,
+      SEGREGATED_TEAMS: -8,
+      REPEAT_PARTNER: -8,
+      REPEAT_OPPONENT: -2,
+    }
+  };
+
+  // ----------------------------
+  // Utilities
+  // ----------------------------
+  const $ = (id) => document.getElementById(id);
+  function setDisabled(el, val) { el.disabled = !!val; }
+  function shuffle(arr) { // Fisher-Yates in-place
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+  function padRight(str, n) { str = String(str); return str + (" ".repeat(Math.max(0, n - str.length))); }
+
+  function normalizeName(s) {
+    return s.trim().replace(/\s+/g, ' ');
+  }
+  function canonicalKey(s) {
+    return normalizeName(s).toLowerCase();
+  }
+
+  function parseNames(text, gender) {
+    if (!text) return [];
+    const parts = text.replace(/,/g, '\n').split(/\n+/).map(t => normalizeName(t)).filter(Boolean);
+    return parts.map(name => ({ id: canonicalKey(name), name, g: gender }));
+  }
+  function parseCourts(text) {
+    if (!text) return [];
+    const parts = text.replace(/[\n,]+/g, ' ').split(/\s+/).map(t => t.trim()).filter(Boolean);
+    return parts; // treat as strings; keep order
+  }
+
+  function findDuplicates(items, keyFn = s => s) {
+    const seen = new Map(); const dups = new Set();
+    for (const it of items) {
+      const k = keyFn(it);
+      if (seen.has(k)) dups.add(k); else seen.set(k, true);
+    }
+    return Array.from(dups);
+  }
+
+  function parseStartTime(input) {
+    // Accepts formats like "6:00 am", "06:00 AM", "6 AM" (optional :mm), with AM/PM
+    const s = input.trim();
+    const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+    if (!m) return null;
+    let h = parseInt(m[1], 10);
+    const min = m[2] ? parseInt(m[2], 10) : 0;
+    const ampm = m[3].toUpperCase();
+    if (h === 12) h = (ampm === 'AM') ? 0 : 12; else h = (ampm === 'PM') ? h + 12 : h;
+    const d = new Date(); d.setHours(h, min, 0, 0);
+    return d;
+  }
+  function formatAMPM(d) {
+    let h = d.getHours(); const m = d.getMinutes();
+    const am = h < 12; h = h % 12; if (h === 0) h = 12;
+    const mm = String(m).padStart(2, '0');
+    return `${h}:${mm} ${am ? 'AM' : 'PM'}`;
+  }
+  function buildTimes(startStr, minutes, cycles) {
+    const start = parseStartTime(startStr);
+    if (!start) return null;
+    const out = [];
+    for (let i = 0; i < cycles; i++) {
+      const t = new Date(start.getTime() + i * minutes * 60 * 1000);
+      out.push(formatAMPM(t));
+    }
+    return out;
+  }
+
+  // ----------------------------
+  // Scheduling core
+  // ----------------------------
+  function generate(playersM, playersF, courts, times) {
+    const P = playersM.length + playersF.length;
+    const C = courts.length;
+    if (P === 0 || C === 0) return { text: '', summary: 'No players or courts', score: -Infinity, matrix: null };
+
+    const allPlayers = playersM.concat(playersF);
+    const idToName = new Map(allPlayers.map(p => [p.id, p.name]));
+
+    let best = null; let bestScore = -Infinity; let bestSummary = null; let bestMatrix = null;
+
+    for (let iter = 0; iter < CONFIG.ITERATIONS; iter++) {
+      // Per-run history
+      const hist = new Map(); // id -> { partners:Set, opponents:Set, byes:number, consec:number, lastBye:boolean }
+      for (const p of allPlayers) hist.set(p.id, { partners: new Set(), opponents: new Set(), byes: 0, consec: 0, lastBye: false });
+
+      const cyclesData = []; // [{ time, matches:[{court, a1,a2,b1,b2}], byes:[ids], active }]
+      let totalScore = 0; let countMixed = 0; let countRepPartners = 0; let countRepOpps = 0;
+
+      for (let ci = 0; ci < times.length; ci++) {
+        // Determine active courts & byes for this cycle
+        const active = Math.min(C, Math.floor(P / 4));
+        const byesNeeded = Math.max(0, P - (active * 4));
+
+        const shuffled = shuffle(allPlayers.slice());
+        const playing = shuffled.slice(0, active * 4);
+        const byesList = shuffled.slice(active * 4, active * 4 + byesNeeded).map(p => p.id);
+
+        // update bye consec tracking (but scoring applied at end)
+        for (const p of allPlayers) {
+          const h = hist.get(p.id);
+          const isBye = byesList.includes(p.id);
+          if (isBye) { if (h.lastBye) h.consec += 1; h.lastBye = true; h.byes += 1; }
+          else { h.lastBye = false; }
+        }
+
+        // chunk playing into foursomes
+        const foursomes = [];
+        for (let i = 0; i < playing.length; i += 4) foursomes.push(playing.slice(i, i + 4));
+
+        const matches = [];
+        for (let fi = 0; fi < foursomes.length; fi++) {
+          const four = foursomes[fi];
+          const pairing = pairFoursome(four, hist);
+          // Score composition & history effects now; update history
+          const { score: localScore, mixed, repPartners, repOpps } = scoreMatch(pairing, hist);
+          totalScore += localScore; // includes composition & repeats
+          if (mixed) countMixed += 1;
+          if (repPartners) countRepPartners += repPartners;
+          if (repOpps) countRepOpps += repOpps;
+          // Update history with this match
+          commitMatchToHistory(pairing, hist);
+          matches.push(pairing);
+        }
+
+        cyclesData.push({ time: times[ci], matches, byes: byesList, active });
+      }
+
+      // Fairness: byes distribution penalties (excess & consecutive)
+      let actualTotalByes = 0; hist.forEach(h => actualTotalByes += h.byes);
+      const avg = actualTotalByes / P;
+      const bandLow = Math.floor(avg); const bandHigh = Math.ceil(avg);
+
+      let excessPlayers = 0; let consecTotal = 0;
+      hist.forEach(h => {
+        if (h.byes > bandHigh) { totalScore += CONFIG.WEIGHTS.BYE_EXCESS * (h.byes - bandHigh); excessPlayers += 1; }
+        if (h.consec > 0) { totalScore += CONFIG.WEIGHTS.BYE_CONSECUTIVE * h.consec; consecTotal += h.consec; }
+      });
+
+      if (totalScore > bestScore) {
+        bestScore = totalScore;
+        best = cyclesData;
+        bestSummary = { countMixed, countRepPartners, countRepOpps, actualTotalByes, avg, bandLow, bandHigh, excessPlayers, consecTotal, P };
+        const includeResting = actualTotalByes > 0;
+        bestMatrix = renderMatrix(best, courts, idToName, includeResting);
+      }
+    }
+
+    const text = renderTextTable(bestMatrix.header, bestMatrix.rows);
+
+    // Percent score = average compliance across rules
+    const totalMatches = best.reduce((acc, cyc) => acc + cyc.matches.length, 0);
+    const mixedRate = totalMatches ? (bestSummary.countMixed / totalMatches) : 0;
+    const partnerRate = totalMatches ? (1 - (bestSummary.countRepPartners / (2 * totalMatches))) : 1;
+    const oppRate = totalMatches ? (1 - (bestSummary.countRepOpps / (4 * totalMatches))) : 1;
+    let byeRate = 1;
+    if (bestSummary.actualTotalByes > 0) {
+      const overFrac = bestSummary.P ? (bestSummary.excessPlayers / bestSummary.P) : 0;
+      const consecFrac = bestSummary.P ? Math.min(1, bestSummary.consecTotal / bestSummary.P) : 0;
+      byeRate = 1 - 0.5 * (overFrac + consecFrac);
+      if (byeRate < 0) byeRate = 0;
+    }
+    const pct = Math.round(100 * (mixedRate + partnerRate + oppRate + byeRate) / 4);
+
+    const summary = `<span class="percent">Score: ${pct}%</span>  ·  Mixed games: ${bestSummary.countMixed}/${totalMatches}  ·  Repeat partners: ${bestSummary.countRepPartners}  ·  Repeat opponents: ${bestSummary.countRepOpps}`;
+    return { text, summary, score: bestScore, percent: pct, matrix: bestMatrix };
+  }
+
+  function pairFoursome(four, hist) {
+    // four: [{id,name,g}, ...]
+    const [p0, p1, p2, p3] = four;
+    const opts = [
+      { a:[p0,p1], b:[p2,p3] },
+      { a:[p0,p2], b:[p1,p3] },
+      { a:[p0,p3], b:[p1,p2] },
+    ];
+    let best = null; let bestScore = -Infinity;
+    for (const opt of opts) {
+      const s = scorePairingLocal(opt, hist);
+      if (s > bestScore) { bestScore = s; best = opt; }
+    }
+    return best; // {a:[p,p], b:[p,p]}
+  }
+
+  function scorePairingLocal(pairing, hist) {
+    const W = CONFIG.LOCAL;
+    let s = 0;
+    const [a1,a2] = pairing.a; const [b1,b2] = pairing.b;
+    const aMixed = a1.g !== a2.g; const bMixed = b1.g !== b2.g;
+    // prefer mixed pairs
+    if (aMixed) s += W.MIXED_PAIR; if (bMixed) s += W.MIXED_PAIR;
+    if (aMixed && bMixed) s += W.MIXED_BOTH_PAIRS;
+    // discourage segregated MM vs FF (or FF vs MM)
+    const aSame = a1.g === a2.g; const bSame = b1.g === b2.g;
+    if (aSame && bSame && a1.g !== b1.g) s += W.SEGREGATED_TEAMS;
+    // discourage repeat partners
+    const ha1 = hist.get(a1.id), ha2 = hist.get(a2.id), hb1 = hist.get(b1.id), hb2 = hist.get(b2.id);
+    if (ha1.partners.has(a2.id) || ha2.partners.has(a1.id)) s += W.REPEAT_PARTNER;
+    if (hb1.partners.has(b2.id) || hb2.partners.has(b1.id)) s += W.REPEAT_PARTNER;
+    // avoid repeat opponents
+    const aOpps = [b1.id, b2.id], bOpps = [a1.id, a2.id];
+    for (const id of aOpps) if (ha1.opponents.has(id) || ha2.opponents.has(id)) s += W.REPEAT_OPPONENT;
+    for (const id of bOpps) if (hb1.opponents.has(id) || hb2.opponents.has(id)) s += W.REPEAT_OPPONENT;
+    return s;
+  }
+
+  function scoreMatch(pairing, hist) {
+    const W = CONFIG.WEIGHTS;
+    const all = [pairing.a[0], pairing.a[1], pairing.b[0], pairing.b[1]];
+    const m = all.filter(p => p.g === 'M').length;
+    const f = all.length - m;
+
+    let s = 0; let mixed = false; let repPartners = 0; let repOpps = 0;
+    if (m === 2 && f === 2) {
+      const aMixed = pairing.a[0].g !== pairing.a[1].g;
+      const bMixed = pairing.b[0].g !== pairing.b[1].g;
+      if (aMixed && bMixed) { s += W.MIXED_FOURSOME; mixed = true; }
+      else { s += W.SEGREGATED_TEAMS; }
+    } else if (m === 3 || f === 3) {
+      s += W.THREE_ONE;
+    } else if (m === 4 || f === 4) {
+      s += W.FOUR_ZERO;
+    }
+
+    // Repeat partners / opponents penalties (relative to history before this match)
+    const [a1,a2] = pairing.a, [b1,b2] = pairing.b;
+    const ha1 = hist.get(a1.id), ha2 = hist.get(a2.id), hb1 = hist.get(b1.id), hb2 = hist.get(b2.id);
+    const rptA = (ha1.partners.has(a2.id) || ha2.partners.has(a1.id));
+    const rptB = (hb1.partners.has(b2.id) || hb2.partners.has(b1.id));
+    if (rptA) { s += W.REPEAT_PARTNER; repPartners += 1; }
+    if (rptB) { s += W.REPEAT_PARTNER; repPartners += 1; }
+
+    const aOppIds = [b1.id, b2.id];
+    const bOppIds = [a1.id, a2.id];
+    // Count if any opponent repeats for each player (per player basis)
+    for (const id of aOppIds) {
+      const ha1 = hist.get(a1.id), ha2 = hist.get(a2.id);
+      if (ha1.opponents.has(id)) { s += W.REPEAT_OPPONENT; repOpps += 1; break; }
+    }
+    for (const id of aOppIds) {
+      const ha1 = hist.get(a1.id), ha2 = hist.get(a2.id);
+      if (ha2.opponents.has(id)) { s += W.REPEAT_OPPONENT; repOpps += 1; break; }
+    }
+    for (const id of bOppIds) {
+      const hb1 = hist.get(b1.id), hb2 = hist.get(b2.id);
+      if (hb1.opponents.has(id)) { s += W.REPEAT_OPPONENT; repOpps += 1; break; }
+    }
+    for (const id of bOppIds) {
+      const hb1 = hist.get(b1.id), hb2 = hist.get(b2.id);
+      if (hb2.opponents.has(id)) { s += W.REPEAT_OPPONENT; repOpps += 1; break; }
+    }
+
+    return { score: s, mixed, repPartners, repOpps };
+  }
+
+  function commitMatchToHistory(pairing, hist) {
+    const [a1,a2] = pairing.a, [b1,b2] = pairing.b;
+    hist.get(a1.id).partners.add(a2.id); hist.get(a2.id).partners.add(a1.id);
+    hist.get(b1.id).partners.add(b2.id); hist.get(b2.id).partners.add(b1.id);
+    // Opponents
+    for (const p of [a1,a2]) { hist.get(p.id).opponents.add(b1.id); hist.get(p.id).opponents.add(b2.id); }
+    for (const p of [b1,b2]) { hist.get(p.id).opponents.add(a1.id); hist.get(p.id).opponents.add(a2.id); }
+  }
+
+  function renderMatrix(cyclesData, courts, idToName, includeResting) {
+    // Build a matrix for textual table: header + rows (arrays of strings)
+    const header = ["Time"].concat(courts.map(c => `Court ${c}`));
+    if (includeResting) header.push("Resting");
+    const rows = [];
+
+    for (const cyc of cyclesData) {
+      const row = [cyc.time];
+      let active = cyc.active; let mi = 0;
+      for (let ci = 0; ci < courts.length; ci++) {
+        if (ci < active) {
+          const m = cyc.matches[mi++];
+          if (!m) { row.push('—'); continue; }
+          const text = `${m.a[0].name} & ${m.a[1].name} vs ${m.b[0].name} & ${m.b[1].name}`;
+          row.push(text);
+        } else { row.push('—'); }
+      }
+      if (includeResting) {
+        const restNames = (cyc.byes || []).map(id => idToName.get(id) || id).join(', ');
+        row.push(restNames || '—');
+      }
+      rows.push(row);
+    }
+    return { header, rows };
+  }
+
+  function renderTextTable(header, rows) {
+    // Column widths
+    const cols = header.length;
+    const widths = Array(cols).fill(0);
+    for (let c = 0; c < cols; c++) widths[c] = Math.max(widths[c], header[c].length);
+    for (const r of rows) for (let c = 0; c < cols; c++) widths[c] = Math.max(widths[c], (r[c] || '').length);
+    const gap = '  ';
+
+    const headerLine = header.map((h,i) => padRight(h, widths[i])).join(gap);
+    const lines = [headerLine];
+    for (const r of rows) lines.push(r.map((cell,i) => padRight(cell || '', widths[i])).join(gap));
+    return lines.join('\n');
+  }
+
+  // ----------------------------
+  // UI glue
+  // ----------------------------
+  let lastBestScore = -Infinity; let lastText = ''; let lastMatrix = null; let dirty = true;
+
+  function clearOutput(onChangeMsg = true) {
+    $("output").textContent = onChangeMsg ? '(no schedule yet)' : '';
+    $("summary").innerHTML = '';
+    setDisabled($("copyBtn"), true);
+    setDisabled($("printBtn"), true);
+    setDisabled($("tryAgain"), true);
+    lastBestScore = -Infinity; lastText = ''; lastMatrix = null;
+  }
+
+  function collectAndValidate() {
+    const males = parseNames($("males").value, 'M');
+    const females = parseNames($("females").value, 'F');
+    const courts = parseCourts($("courts").value);
+    const slot = Math.max(1, parseInt($("slot").value || '15', 10));
+    const cycles = Math.max(1, parseInt($("cycles").value || '8', 10));
+    const startStr = $("start").value.trim();
+
+    // Clear error styles
+    $("males").classList.remove('error');
+    $("females").classList.remove('error');
+    $("courts").classList.remove('error');
+
+    const warnings = [];
+
+    // Duplicate players across combined list (case-insensitive)
+    const all = males.concat(females);
+    const dupKeys = findDuplicates(all, p => p.id);
+    if (dupKeys.length) {
+      const dupNames = new Set();
+      for (const p of all) if (dupKeys.includes(p.id)) dupNames.add(p.name);
+      warnings.push(`Duplicate player names detected (fix before generating): ${Array.from(dupNames).join(', ')}`);
+      // Highlight both textareas
+      $("males").classList.add('error');
+      $("females").classList.add('error');
+    }
+
+    // Duplicate courts (warn but proceed)
+    const courtDupKeys = findDuplicates(courts, s => s.toLowerCase());
+    if (courtDupKeys.length) {
+      const shown = courts.filter(c => courtDupKeys.includes(c.toLowerCase()));
+      warnings.push(`Duplicate court names: ${Array.from(new Set(shown)).join(', ')}`);
+      $("courts").classList.add('error');
+    }
+
+    // Validate counts
+    const P = all.length; const C = courts.length; const S = 4 * C;
+    if (P === 0) warnings.push('No players provided.');
+    if (C === 0) warnings.push('No courts provided.');
+
+    if (P - S > 3) warnings.push(`More than 3 resters per cycle (players: ${P}, seats: ${S}).`);
+    if (S - P >= 4) warnings.push(`Unused courts likely (players: ${P}, seats: ${S}).`);
+
+    const times = buildTimes(startStr, slot, cycles);
+    if (!times) warnings.push('Invalid start time. Use format like "06:00 AM".');
+
+    return { males, females, courts, times, warnings, hasBlocking: dupKeys.length > 0 || !times || P === 0 || C === 0 };
+  }
+
+  function showWarnings(warns) {
+    const box = $("warnings");
+    if (!warns.length) { box.textContent = ''; box.classList.add('hidden'); return; }
+    box.classList.remove('hidden');
+    box.innerHTML = warns.map(w => `• ${w}`).join('<br/>');
+  }
+
+  function runGenerate(replaceOnlyIfBetter = false) {
+    const { males, females, courts, times, warnings, hasBlocking } = collectAndValidate();
+    showWarnings(warnings);
+    if (hasBlocking) { clearOutput(); return; }
+    const { text, summary, score, matrix } = generate(males, females, courts, times);
+    if (!replaceOnlyIfBetter || score > lastBestScore) {
+      lastBestScore = score; lastText = text; lastMatrix = matrix; dirty = false;
+      $("output").textContent = text;
+      $("summary").innerHTML = summary;
+      setDisabled($("copyBtn"), !text.trim());
+      setDisabled($("printBtn"), !text.trim());
+      setDisabled($("tryAgain"), false);
+    }
+  }
+
+  function copyOutput() {
+    const txt = $("output").textContent || '';
+    if (!txt.trim()) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = txt; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch(e) {}
+      document.body.removeChild(ta);
+    }
+  }
+
+  function buildPrintTableHTML(matrix) {
+    if (!matrix) return '';
+    const esc = (s) => String(s).replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
+    const thead = '<tr>' + matrix.header.map(h => `<th>${esc(h)}</th>`).join('') + '</tr>';
+    const rows = matrix.rows.map(r => '<tr>' + r.map(c => `<td>${esc(c || '')}</td>`).join('') + '</tr>').join('');
+    return `<table class=\"sched\"><thead>${thead}</thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function openPrintView() {
+    const txt = $("output").textContent || '';
+    if (!txt.trim() || !lastMatrix) return;
+    const title = $("printTitle").value.trim() || 'Sunrise Smashers';
+    const subtitle = $("printSubtitle").value.trim();
+    const w = window.open('', '_blank');
+    const tableHTML = buildPrintTableHTML(lastMatrix);
+    const css = `body{margin:24px;font-family:${CSS.escape(getComputedStyle(document.body).fontFamily)};color:#0b1320}
+      h1{font-size:22px;margin:0 0 4px} h2{font-size:14px;margin:0 0 12px;color:#5b6678}
+      table.sched{border-collapse:collapse;width:100%;} table.sched th, table.sched td{border:1px solid #dfe3ea;padding:8px;text-align:left;}
+      table.sched th{background:#f7f8fb}
+      @page{margin:15mm}`;
+    const html = `<!doctype html><html><head><meta charset=\"utf-8\"><title>Schedule</title>
+      <style>${css}</style>
+      </head><body>
+      <h1>${title.replace(/[&<>]/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[s]))}</h1>
+      ${subtitle ? `<h2>${subtitle.replace(/[&<>]/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[s]))}</h2>` : ''}
+      ${tableHTML}
+      <script>window.onload = () => { window.print(); }${'</scr' + 'ipt>'}${'</bo' + 'dy>'}${'</ht' + 'ml>'}$`;
+    w.document.open(); w.document.write(html); w.document.close();
+  }
+
+  function markDirty() {
+    dirty = true; clearOutput();
+  }
+
+  // Hook up events
+  $("generate").addEventListener('click', () => { runGenerate(false); });
+  $("tryAgain").addEventListener('click', () => { if (!dirty) runGenerate(true); });
+  $("copyBtn").addEventListener('click', copyOutput);
+  $("printBtn").addEventListener('click', openPrintView);
+
+  // Any input change clears output and disables follow-up actions
+  ["males","females","courts","start","slot","cycles","printTitle","printSubtitle"].forEach(id => {
+    $(id).addEventListener('input', markDirty);
+  });
+
+  // Seed example for quick testing
+  $("males").value = "Joe, Frank, Chris, Kevin, John, Matt, Chris S., Mark";
+  $("females").value = "Anna, Liz, Kim, Sara";
+  $("courts").value = "1 2 4";
+  clearOutput();
+
+  </script>
+</body>
+</html>
