@@ -285,7 +285,7 @@
       }
     }
 
-    const text = renderTextTable(bestMatrix.header, bestMatrix.rows);
+    const text = renderBlocksTextFromMatrix(bestMatrix.header, bestMatrix.rows);
 
     // Percent score = average compliance across rules
     const totalMatches = best.reduce((acc, cyc) => acc + cyc.matches.length, 0);
@@ -441,6 +441,33 @@
     return lines.join('\n');
   }
 
+  function renderBlocksTextFromMatrix(header, rows) {
+    // header: ["Time", "Court X", ..., (optional) "Resting"]
+    if (!header || !rows) return '';
+    const hasResting = header[header.length - 1] === 'Resting';
+    const lastCourtIdx = hasResting ? header.length - 2 : header.length - 1;
+    const lines = [];
+    for (const r of rows) {
+      const time = r[0] || '';
+      if (time) lines.push(`Time ${time}`);
+      for (let i = 1; i <= lastCourtIdx - 0; i++) {
+        const label = header[i];
+        const val = r[i];
+        if (val && val !== '—') {
+          lines.push(`  ${label}: ${val}`);
+        }
+      }
+      if (hasResting) {
+        const rest = r[header.length - 1];
+        if (rest && rest !== '—') {
+          lines.push(`  Resting: ${rest}`);
+        }
+      }
+      lines.push(''); // blank line between time blocks
+    }
+    return lines.join('\n');
+  }
+
   // ----------------------------
   // UI glue
   // ----------------------------
@@ -539,12 +566,32 @@
     }
   }
 
-  function buildPrintTableHTML(matrix) {
+  function buildPrintBlocksHTML(matrix) {
     if (!matrix) return '';
     const esc = (s) => String(s).replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
-    const thead = '<tr>' + matrix.header.map(h => `<th>${esc(h)}</th>`).join('') + '</tr>';
-    const rows = matrix.rows.map(r => '<tr>' + r.map(c => `<td>${esc(c || '')}</td>`).join('') + '</tr>').join('');
-    return `<table class=\"sched\"><thead>${thead}</thead><tbody>${rows}</tbody></table>`;
+    const header = matrix.header;
+    const hasResting = header[header.length - 1] === 'Resting';
+    const lastCourtIdx = hasResting ? header.length - 2 : header.length - 1;
+    const blocks = [];
+    for (const r of matrix.rows) {
+      const time = esc(r[0] || '');
+      const lines = [];
+      for (let i = 1; i <= lastCourtIdx - 0; i++) {
+        const label = esc(header[i]);
+        const val = r[i];
+        if (val && val !== '—') {
+          lines.push(`<div class=\"entry\"><span class=\"label\">${label}:</span> ${esc(val)}</div>`);
+        }
+      }
+      if (hasResting) {
+        const rest = r[header.length - 1];
+        if (rest && rest !== '—') {
+          lines.push(`<div class=\"entry resting\"><span class=\"label\">Resting:</span> ${esc(rest)}</div>`);
+        }
+      }
+      blocks.push(`<div class=\"time-block\"><div class=\"time\">Time ${time}</div>${lines.join('')}</div>`);
+    }
+    return `<div class=\"blocks\">${blocks.join('')}</div>`;
   }
 
   function openPrintView() {
@@ -553,18 +600,22 @@
     const title = $("printTitle").value.trim() || 'Sunrise Smashers';
     const subtitle = $("printSubtitle").value.trim();
     const w = window.open('', '_blank');
-    const tableHTML = buildPrintTableHTML(lastMatrix);
+    const blocksHTML = buildPrintBlocksHTML(lastMatrix);
     const css = `body{margin:24px;font-family:${CSS.escape(getComputedStyle(document.body).fontFamily)};color:#0b1320}
       h1{font-size:22px;margin:0 0 4px} h2{font-size:14px;margin:0 0 12px;color:#5b6678}
-      table.sched{border-collapse:collapse;width:100%;} table.sched th, table.sched td{border:1px solid #dfe3ea;padding:8px;text-align:left;}
-      table.sched th{background:#f7f8fb}
+      .blocks{display:block}
+      .time-block{margin:0 0 14px}
+      .time-block .time{font-size:18px;font-weight:700;margin:0 0 6px}
+      .entry{margin-left:12px;font-size:16px;line-height:1.35}
+      .entry .label{font-weight:600}
+      .entry.resting{color:#5b6678}
       @page{margin:15mm}`;
     const html = `<!doctype html><html><head><meta charset=\"utf-8\"><title>Schedule</title>
       <style>${css}</style>
       </head><body>
       <h1>${title.replace(/[&<>]/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[s]))}</h1>
       ${subtitle ? `<h2>${subtitle.replace(/[&<>]/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[s]))}</h2>` : ''}
-      ${tableHTML}
+      ${blocksHTML}
       <script>window.onload = () => { window.print(); }${'</scr' + 'ipt>'}${'</bo' + 'dy>'}${'</ht' + 'ml>'}$`;
     w.document.open(); w.document.write(html); w.document.close();
   }
