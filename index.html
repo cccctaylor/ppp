@@ -54,6 +54,19 @@
 
     .out-controls { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .out-controls input[type="text"] { width: 180px; }
+
+    /* Modal */
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: none; align-items: center; justify-content: center; padding: 16px; }
+    .modal.show { display: flex; }
+    .dialog { background: #fff; border: 1px solid var(--line); border-radius: 12px; max-width: 720px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.12); }
+    .dialog header { padding: 14px 16px; border-bottom: 1px solid var(--line); font-weight: 700; }
+    .dialog .body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+    .dialog footer { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; }
+    .form-row { display: grid; grid-template-columns: 1fr minmax(120px, 160px); gap: 10px; align-items: center; }
+    .desc { color: var(--muted); font-size: 12px; margin-top: -4px; grid-column: 1 / -1; }
+    .table { width: 100%; border-collapse: collapse; font-family: var(--mono); }
+    .table th, .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+    .table th { font-weight: 700; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -92,6 +105,7 @@
       <div class="row controls" style="margin-top:8px;">
         <button id="generate">Generate</button>
         <button id="tryAgain" disabled>Try for better</button>
+        <button id="setupBtn">Setup</button>
       </div>
     </div>
   </div>
@@ -108,6 +122,39 @@
     <input id="printSubtitle" type="text" value="Schedule" />
     <button id="copyBtn" disabled>Copy</button>
     <button id="printBtn" disabled>Print</button>
+    <button id="detailsBtn" disabled>Details</button>
+  </div>
+
+  <!-- Setup Modal -->
+  <div id="setupModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+    <div class="dialog">
+      <header id="setupTitle">Setup: Weights</header>
+      <div class="body">
+        <div class="muted">Adjust the weights that influence schedule scoring. Positive favors, negative penalizes.</div>
+        <div id="weightsForm"></div>
+      </div>
+      <footer>
+        <button id="setupReset">Reset to defaults</button>
+        <div style="flex:1"></div>
+        <button id="setupCancel">Cancel</button>
+        <button id="setupSave">Save</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Details Modal -->
+  <div id="detailsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="detailsTitle">
+    <div class="dialog">
+      <header id="detailsTitle">Score Details</header>
+      <div class="body">
+        <div id="detailsTableWrap"></div>
+        <div class="muted">Note: Totals exclude pairing heuristics (LOCAL) used inside a foursome.</div>
+      </div>
+      <footer>
+        <div style="flex:1"></div>
+        <button id="detailsClose">Close</button>
+      </footer>
+    </div>
   </div>
 
   <script>
@@ -135,6 +182,9 @@
     }
   };
 
+  // Store a deep copy of defaults before any overrides
+  const DEFAULT_WEIGHTS = JSON.parse(JSON.stringify(CONFIG.WEIGHTS));
+
   // ----------------------------
   // Utilities
   // ----------------------------
@@ -148,6 +198,41 @@
     return arr;
   }
   function padRight(str, n) { str = String(str); return str + (" ".repeat(Math.max(0, n - str.length))); }
+
+  // Cookie utilities
+  function setCookie(name, value, days) {
+    const d = new Date();
+    d.setTime(d.getTime() + (days*24*60*60*1000));
+    const expires = "; expires=" + d.toUTCString();
+    document.cookie = name + "=" + encodeURIComponent(value) + expires + "; path=/";
+  }
+  function getCookie(name) {
+    const nameEQ = name + "=";
+    const ca = document.cookie.split(';');
+    for (let i = 0; i < ca.length; i++) {
+      let c = ca[i];
+      while (c.charAt(0) === ' ') c = c.substring(1, c.length);
+      if (c.indexOf(nameEQ) === 0) return decodeURIComponent(c.substring(nameEQ.length, c.length));
+    }
+    return null;
+  }
+  function loadWeightsFromCookie() {
+    try {
+      const raw = getCookie('PPP_WEIGHTS');
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return;
+      for (const k of Object.keys(CONFIG.WEIGHTS)) {
+        if (Object.prototype.hasOwnProperty.call(parsed, k)) {
+          const v = Number(parsed[k]);
+          if (Number.isFinite(v)) CONFIG.WEIGHTS[k] = v;
+        }
+      }
+    } catch(e) { /* ignore */ }
+  }
+  function saveWeightsToCookie() {
+    setCookie('PPP_WEIGHTS', JSON.stringify(CONFIG.WEIGHTS), 3650);
+  }
 
   function normalizeName(s) {
     return s.trim().replace(/\s+/g, ' ');
@@ -216,7 +301,7 @@
     const allPlayers = playersM.concat(playersF);
     const idToName = new Map(allPlayers.map(p => [p.id, p.name]));
 
-    let best = null; let bestScore = -Infinity; let bestSummary = null; let bestMatrix = null;
+    let best = null; let bestScore = -Infinity; let bestSummary = null; let bestMatrix = null; let bestCounts = null;
 
     for (let iter = 0; iter < CONFIG.ITERATIONS; iter++) {
       // Per-run history
@@ -225,6 +310,16 @@
 
       const cyclesData = []; // [{ time, matches:[{court, a1,a2,b1,b2}], byes:[ids], active }]
       let totalScore = 0; let countMixed = 0; let countRepPartners = 0; let countRepOpps = 0;
+      const runCounts = {
+        MIXED_FOURSOME: 0,
+        THREE_ONE: 0,
+        FOUR_ZERO: 0,
+        SEGREGATED_TEAMS: 0,
+        REPEAT_PARTNER: 0,
+        REPEAT_OPPONENT: 0,
+        BYE_EXCESS: 0,
+        BYE_CONSECUTIVE: 0,
+      };
 
       for (let ci = 0; ci < times.length; ci++) {
         // Determine active courts & byes for this cycle
@@ -257,6 +352,21 @@
           if (mixed) countMixed += 1;
           if (repPartners) countRepPartners += repPartners;
           if (repOpps) countRepOpps += repOpps;
+          // Count criteria occurrences for WEIGHTS
+          const all = [pairing.a[0], pairing.a[1], pairing.b[0], pairing.b[1]];
+          const m = all.filter(p => p.g === 'M').length;
+          const f = all.length - m;
+          if (m === 2 && f === 2) {
+            const aMixed = pairing.a[0].g !== pairing.a[1].g;
+            const bMixed = pairing.b[0].g !== pairing.b[1].g;
+            if (aMixed && bMixed) runCounts.MIXED_FOURSOME += 1; else runCounts.SEGREGATED_TEAMS += 1;
+          } else if (m === 3 || f === 3) {
+            runCounts.THREE_ONE += 1;
+          } else if (m === 4 || f === 4) {
+            runCounts.FOUR_ZERO += 1;
+          }
+          if (repPartners) runCounts.REPEAT_PARTNER += repPartners;
+          if (repOpps) runCounts.REPEAT_OPPONENT += repOpps;
           // Update history with this match
           commitMatchToHistory(pairing, hist);
           matches.push(pairing);
@@ -272,8 +382,8 @@
 
       let excessPlayers = 0; let consecTotal = 0;
       hist.forEach(h => {
-        if (h.byes > bandHigh) { totalScore += CONFIG.WEIGHTS.BYE_EXCESS * (h.byes - bandHigh); excessPlayers += 1; }
-        if (h.consec > 0) { totalScore += CONFIG.WEIGHTS.BYE_CONSECUTIVE * h.consec; consecTotal += h.consec; }
+        if (h.byes > bandHigh) { const x = (h.byes - bandHigh); totalScore += CONFIG.WEIGHTS.BYE_EXCESS * x; runCounts.BYE_EXCESS += x; excessPlayers += 1; }
+        if (h.consec > 0) { totalScore += CONFIG.WEIGHTS.BYE_CONSECUTIVE * h.consec; runCounts.BYE_CONSECUTIVE += h.consec; consecTotal += h.consec; }
       });
 
       if (totalScore > bestScore) {
@@ -282,6 +392,7 @@
         bestSummary = { countMixed, countRepPartners, countRepOpps, actualTotalByes, avg, bandLow, bandHigh, excessPlayers, consecTotal, P };
         const includeResting = actualTotalByes > 0;
         bestMatrix = renderMatrix(best, courts, idToName, includeResting);
+        bestCounts = runCounts;
       }
     }
 
@@ -302,7 +413,7 @@
     const pct = Math.round(100 * (mixedRate + partnerRate + oppRate + byeRate) / 4);
 
     const summary = `<span class="percent">Score: ${pct}%</span>  ·  Mixed games: ${bestSummary.countMixed}/${totalMatches}  ·  Repeat partners: ${bestSummary.countRepPartners}  ·  Repeat opponents: ${bestSummary.countRepOpps}`;
-    return { text, summary, score: bestScore, percent: pct, matrix: bestMatrix };
+    return { text, summary, score: bestScore, percent: pct, matrix: bestMatrix, counts: bestCounts };
   }
 
   function pairFoursome(four, hist) {
@@ -471,13 +582,24 @@
   // ----------------------------
   // UI glue
   // ----------------------------
-  let lastBestScore = -Infinity; let lastText = ''; let lastMatrix = null; let dirty = true;
+  let lastBestScore = -Infinity; let lastText = ''; let lastMatrix = null; let lastCounts = null; let dirty = true;
+  const WEIGHT_DESCRIPTIONS = {
+    MIXED_FOURSOME: 'Mixed foursome: both pairs are mixed gender',
+    THREE_ONE: '3 of one gender with 1 of the other in a foursome',
+    FOUR_ZERO: 'All same gender in a foursome',
+    SEGREGATED_TEAMS: 'Segregated teams: MM vs FF (or vice versa)',
+    REPEAT_PARTNER: 'Same partners appear together again',
+    REPEAT_OPPONENT: 'A player faces an opponent they have already played',
+    BYE_EXCESS: 'Extra byes beyond the fair-share band',
+    BYE_CONSECUTIVE: 'Consecutive byes for the same player',
+  };
 
   function clearOutput(onChangeMsg = true) {
     $("output").textContent = onChangeMsg ? '(no schedule yet)' : '';
     $("summary").innerHTML = '';
     setDisabled($("copyBtn"), true);
     setDisabled($("printBtn"), true);
+    setDisabled($("detailsBtn"), true);
     setDisabled($("tryAgain"), true);
     lastBestScore = -Infinity; lastText = ''; lastMatrix = null;
   }
@@ -542,13 +664,14 @@
     const { males, females, courts, times, warnings, hasBlocking } = collectAndValidate();
     showWarnings(warnings);
     if (hasBlocking) { clearOutput(); return; }
-    const { text, summary, score, matrix } = generate(males, females, courts, times);
+    const { text, summary, score, matrix, counts } = generate(males, females, courts, times);
     if (!replaceOnlyIfBetter || score > lastBestScore) {
-      lastBestScore = score; lastText = text; lastMatrix = matrix; dirty = false;
+      lastBestScore = score; lastText = text; lastMatrix = matrix; lastCounts = counts; dirty = false;
       $("output").textContent = text;
       $("summary").innerHTML = summary;
       setDisabled($("copyBtn"), !text.trim());
       setDisabled($("printBtn"), !text.trim());
+      setDisabled($("detailsBtn"), !text.trim());
       setDisabled($("tryAgain"), false);
     }
   }
@@ -620,6 +743,57 @@
     w.document.open(); w.document.write(html); w.document.close();
   }
 
+  // Setup modal logic
+  function openSetup() {
+    renderWeightsForm(CONFIG.WEIGHTS);
+    $("setupModal").classList.add('show');
+  }
+  function closeSetup() { $("setupModal").classList.remove('show'); }
+  function renderWeightsForm(weights) {
+    const wrap = $("weightsForm");
+    const keys = Object.keys(weights);
+    const rows = keys.map(k => {
+      const desc = WEIGHT_DESCRIPTIONS[k] || '';
+      return `<div class="form-row"><label for="w_${k}"><strong>${k}</strong></label><input id="w_${k}" type="number" step="1" value="${String(weights[k])}"></div>` + (desc ? `<div class="desc">${desc}</div>` : '');
+    });
+    wrap.innerHTML = rows.join('');
+  }
+  function readWeightsFromForm() {
+    const out = { ...CONFIG.WEIGHTS };
+    for (const k of Object.keys(CONFIG.WEIGHTS)) {
+      const el = $("w_" + k);
+      if (!el) continue;
+      const v = Number(el.value);
+      if (Number.isFinite(v)) out[k] = v;
+    }
+    return out;
+  }
+  function applyWeights(newWeights) {
+    for (const k of Object.keys(CONFIG.WEIGHTS)) CONFIG.WEIGHTS[k] = Number(newWeights[k]);
+    saveWeightsToCookie();
+    markDirty();
+  }
+  function resetWeightsToDefaults() {
+    renderWeightsForm(DEFAULT_WEIGHTS);
+  }
+
+  // Details modal logic
+  function openDetails() {
+    if (!lastCounts || !lastMatrix) return;
+    const rows = Object.keys(CONFIG.WEIGHTS).map(k => {
+      const count = Number(lastCounts[k] || 0);
+      const w = Number(CONFIG.WEIGHTS[k] || 0);
+      const contrib = count * w;
+      const desc = WEIGHT_DESCRIPTIONS[k] || '';
+      return `<tr><td><strong>${k}</strong><div class="desc">${desc}</div></td><td>${count}</td><td>${w}</td><td>${contrib}</td></tr>`;
+    });
+    const total = Object.keys(CONFIG.WEIGHTS).reduce((acc,k)=>acc + (Number(lastCounts[k]||0) * Number(CONFIG.WEIGHTS[k]||0)), 0);
+    const html = `<table class="table"><thead><tr><th>Criterion</th><th>Count</th><th>Weight</th><th>Contribution</th></tr></thead><tbody>${rows.join('')}</tbody><tfoot><tr><th colspan="3">Total (WEIGHTS only)</th><th>${total}</th></tr></tfoot></table>`;
+    $("detailsTableWrap").innerHTML = html;
+    $("detailsModal").classList.add('show');
+  }
+  function closeDetails() { $("detailsModal").classList.remove('show'); }
+
   function markDirty() {
     dirty = true; clearOutput();
   }
@@ -629,11 +803,20 @@
   $("tryAgain").addEventListener('click', () => { if (!dirty) runGenerate(true); });
   $("copyBtn").addEventListener('click', copyOutput);
   $("printBtn").addEventListener('click', openPrintView);
+  $("setupBtn").addEventListener('click', openSetup);
+  $("setupCancel").addEventListener('click', closeSetup);
+  $("setupSave").addEventListener('click', () => { const nw = readWeightsFromForm(); applyWeights(nw); closeSetup(); });
+  $("setupReset").addEventListener('click', resetWeightsToDefaults);
+  $("detailsBtn").addEventListener('click', openDetails);
+  $("detailsClose").addEventListener('click', closeDetails);
 
   // Any input change clears output and disables follow-up actions
   ["males","females","courts","start","slot","cycles","printTitle","printSubtitle"].forEach(id => {
     $(id).addEventListener('input', markDirty);
   });
+
+  // Load saved weights from cookie, if any
+  loadWeightsFromCookie();
 
   // Seed example for quick testing
   $("males").value = "Joe, Frank, Chris, Kevin, John, Matt, Chris S., Mark";
